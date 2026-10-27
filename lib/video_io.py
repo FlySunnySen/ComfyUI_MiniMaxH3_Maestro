@@ -320,6 +320,12 @@ def load_video_resampled(
     eof_warned = False
     native_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
+    # Seeking once per frame re-decodes from the previous keyframe every time:
+    # 230 frames of an 8K long-GOP source cost 293s that way, 16s read in order.
+    # Walk forward with grab() and only seek on rewinds or long jumps.
+    pos = 0
+    seek_gap = 48
+
     for src_idx in unique:
         t_sec = max(0.0, src_idx / float(frame_rate or 24.0))
         native_frame = int(round(t_sec * native_fps))
@@ -340,8 +346,18 @@ def load_video_resampled(
                 )
                 eof_warned = True
             continue
-        cap.set(cv2.CAP_PROP_POS_FRAMES, native_frame)
+        gap = native_frame - pos
+        if gap < 0 or gap > seek_gap:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, native_frame)
+            pos = native_frame
+        else:
+            while pos < native_frame:
+                if not cap.grab():
+                    break
+                pos += 1
         ok, bgr = cap.read()
+        if ok:
+            pos = native_frame + 1
         if not ok or bgr is None:
             if fallback is not None:
                 if not hold_past_eof:

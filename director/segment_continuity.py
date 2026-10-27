@@ -18,7 +18,12 @@ from typing import Any
 
 import torch
 
-from ..lib.image_prep import cat_frames_variable_size, fit_canvas, fit_long_edge
+from ..lib.image_prep import (
+    cat_frames_variable_size,
+    fit_canvas,
+    fit_long_edge,
+    pad_frames_to_canvas,
+)
 from .h3_motion_context import (
     CONTINUITY_TASK_KEYS,
     DEFAULT_CONTEXT_FRAMES as DEFAULT_CONTINUITY_OVERLAP,
@@ -1758,16 +1763,25 @@ def concat_continuous_chunks(
     chunks: list[torch.Tensor],
     segments: list[SegmentPlan],
     plan: DirectorPlan,
+    *,
+    consume: bool = False,
 ) -> torch.Tensor:
     """Concatenate with exposure-only seam fix.
 
     Generation settling burn-in handles flash/pulse. Concat RGB morphs are OFF
     (00035: body0/hold→pop caused 拖影 and stutter pulses).
+
+    ``consume=True`` streams the final copy and nulls out ``chunks`` slots as
+    each one lands, so the assembled timeline never coexists with every source
+    chunk (a 685-frame 864×1568 float32 timeline is ~11GB). The caller must
+    not reuse the list afterwards.
     """
     del segments
     if not chunks:
         raise ValueError("concat_continuous_chunks: no chunks")
     if not getattr(plan, "continuity_enabled", False) or len(chunks) < 2:
+        if consume:
+            return _streaming_cat_frames(chunks)
         return cat_frames_variable_size(chunks)
     fixed: list[torch.Tensor] = [chunks[0]]
     for i in range(1, len(chunks)):
@@ -1782,7 +1796,38 @@ def concat_continuous_chunks(
         left, body = _micro_seam_bridge(left, body)
         fixed[-1] = left
         fixed.append(body)
+    if consume:
+        return _streaming_cat_frames(fixed, sources=chunks)
     return cat_frames_variable_size(fixed)
+
+
+def _streaming_cat_frames(
+    frames: list[torch.Tensor],
+    sources: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """torch.cat along time that frees each source slot as its rows land."""
+    if len(frames) == 1:
+        return frames[0]
+    shapes = {(int(c.shape[1]), int(c.shape[2])) for c in frames}
+    if len(shapes) > 1:
+        max_h = max(c.shape[1] for c in frames)
+        max_w = max(c.shape[2] for c in frames)
+        frames = [pad_frames_to_canvas(c, max_w, max_h) for c in frames]
+    out = torch.empty(
+        (sum(int(c.shape[0]) for c in frames),)
+        + tuple(int(s) for s in frames[0].shape[1:]),
+        dtype=frames[0].dtype,
+        device=frames[0].device,
+    )
+    pos = 0
+    for i, c in enumerate(frames):
+        n = int(c.shape[0])
+        out[pos : pos + n].copy_(c)
+        pos += n
+        frames[i] = None
+        if sources is not None:
+            sources[i] = None
+    return out
 
 
 def apply_cached_segment_continuity(

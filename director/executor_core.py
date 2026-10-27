@@ -27,7 +27,7 @@ from .refine_pack import (
 )
 from .refine_sampling import apply_segment_refine
 from .segment_loras import apply_segment_loras, describe_lora_rows
-from .frame_align import minimax_align_frame_count, pad_or_trim_frames
+from .frame_align import minimax_align_frame_count
 from .audio_export import (
     AUDIO_MODE_GENERATE,
     AUDIO_MODE_MUTE,
@@ -38,6 +38,7 @@ from .audio_export import (
 from .segment_runtime import (
     frames_label,
     resolve_segment_raw_clip,
+    resolve_segment_raw_clip_with_lookahead,
     segment_passthrough_chunk,
 )
 from .plan import (
@@ -182,6 +183,20 @@ def _trim_decoded_to_export(
             if int(wf.shape[-1]) > want:
                 audio_dict = {"waveform": wf[..., :want], "sample_rate": sr}
     return decoded, audio_dict
+
+
+def _fit_segment_body(plan: DirectorPlan, frames: torch.Tensor | None) -> torch.Tensor | None:
+    """Resolve segment source frames to the plan canvas (fixed canvas or long-edge fit)."""
+    if frames is None or int(frames.shape[0]) <= 0:
+        return None
+    if plan.output_mode == "fixed":
+        return fit_canvas(frames, plan.width, plan.height)
+    # long_edge may leave storage-sized frames (e.g. 496) that are not
+    # 32-aligned; lock to the resolved plan canvas after the long-edge fit.
+    fitted = fit_video_long_edge(frames, plan.ref_max_size)
+    if int(fitted.shape[1]) != int(plan.height) or int(fitted.shape[2]) != int(plan.width):
+        fitted = fit_canvas(fitted, plan.width, plan.height)
+    return fitted
 
 
 def _ref_tensor_from_seg_refs(refs, index: int) -> torch.Tensor | None:
@@ -662,17 +677,7 @@ def execute_director_plan_core(
             body_raw = raw_clip[:target_len] if int(raw_clip.shape[0]) > target_len else raw_clip
 
         if body_raw is not None and body_raw.shape[0] > 0:
-            if plan.output_mode == "fixed":
-                clip_frames = fit_canvas(body_raw, plan.width, plan.height)
-            else:
-                # long_edge may leave storage-sized frames (e.g. 496) that are not
-                # 32-aligned; lock to the resolved plan canvas after the long-edge fit.
-                clip_frames = fit_video_long_edge(body_raw, plan.ref_max_size)
-                if (
-                    int(clip_frames.shape[1]) != int(plan.height)
-                    or int(clip_frames.shape[2]) != int(plan.width)
-                ):
-                    clip_frames = fit_canvas(clip_frames, plan.width, plan.height)
+            clip_frames = _fit_segment_body(plan, body_raw)
         else:
             clip_frames = None
 
@@ -779,6 +784,43 @@ def execute_director_plan_core(
             else:
                 # Pixel fallback: decoded export has no overshoot beyond the file.
                 prev_end_frame = None
+
+        # v2v/rv2v continuity: widen <Video 1> backwards so ref[k] == target[k]
+        # once the motion-context pin owns the head. Without this the reference
+        # lags the sample timeline by ctx frames and fast motion (dance) pops at
+        # the seam. Must match the use_motion_context gate below (incl. the
+        # skip_first_sample opt-out) or the ref and the pin disagree.
+        #
+        # Head width is exactly the pin span (ctx), NOT sample_len - num_frames:
+        # the 17k+5 align remainder would phase-shift the ref against the pin.
+        # The resulting ref may sit a few frames short of sample_len — official
+        # v2v encodes source[:length] as-is when the clip is shorter, so a short
+        # ref is tolerated; an unaligned ref is not.
+        if (
+            continuity_active
+            and seg.task_key in {"v2v", "rv2v"}
+            and (prev_av is not None or prev_tail is not None)
+            and not skip_first_sample
+            and clip_frames is not None
+        ):
+            ref_ctx_n = snap_context_frames(plan.continuity_overlap_frames)
+            ref_head_n = min(ref_ctx_n, int(seg.start_frame))
+            if ref_head_n > 0:
+                ref_body_ext = resolve_segment_raw_clip_with_lookahead(
+                    plan, seg, start_extra=ref_head_n
+                )
+                ref_ext_frames = _fit_segment_body(plan, ref_body_ext)
+                if ref_ext_frames is not None and int(ref_ext_frames.shape[0]) > int(
+                    raw_clip.shape[0]
+                ):
+                    clip_frames = ref_ext_frames
+                    log.info(
+                        "Segment %d continuity: <Video 1> widened backwards by %d "
+                        "frames so the reference timeline matches the pinned "
+                        "motion-context head.",
+                        seg.index + 1,
+                        ref_head_n,
+                    )
 
         ctx_w = int(plan.width)
         ctx_h = int(plan.height)
@@ -1903,18 +1945,14 @@ def execute_director_plan_core(
             "and continuity pin (no full-timeline concat)."
         )
     else:
-        combined = concat_continuous_chunks(export_chunks, export_segments, plan)
         pre_source = export_pre_chunks if export_pre_chunks else segment_pre_refine
         if not pre_source:
             pre_source = list(segment_outputs)
+        # Alias flags must be decided BEFORE the consuming concatenations null
+        # out the chunk slots below.
         same_as_final = (
             len(pre_source) == len(export_chunks)
             and all(a is b for a, b in zip(pre_source, export_chunks))
-        )
-        pre_combined = (
-            combined
-            if same_as_final
-            else concat_continuous_chunks(pre_source, export_segments, plan)
         )
         if export_pre_face_refine:
             face_source = export_pre_face_chunks if export_pre_face_chunks else segment_pre_face
@@ -1924,14 +1962,23 @@ def execute_director_plan_core(
                 len(face_source) == len(export_chunks)
                 and all(a is b for a, b in zip(face_source, export_chunks))
             )
-            pre_face_combined = (
-                combined
-                if same_as_face
-                else concat_continuous_chunks(face_source, export_segments, plan)
-            )
         else:
             pre_face_combined = None
             segment_pre_face = []
+        # consume=True frees each chunk slot as the timeline is assembled, so
+        # the caches never coexist with all three outputs.
+        combined = concat_continuous_chunks(export_chunks, export_segments, plan, consume=True)
+        pre_combined = (
+            combined
+            if same_as_final
+            else concat_continuous_chunks(pre_source, export_segments, plan, consume=True)
+        )
+        if export_pre_face_refine:
+            pre_face_combined = (
+                combined
+                if same_as_face
+                else concat_continuous_chunks(face_source, export_segments, plan, consume=True)
+            )
     shift_cache.clear()
     if clear_vram_between_segments:
         cleanup_segment_vram(enabled=True, unload_models=False)
