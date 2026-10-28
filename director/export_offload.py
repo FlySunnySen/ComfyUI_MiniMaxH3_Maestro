@@ -54,11 +54,43 @@ def new_offload_dir(plan) -> Path | None:
         return None
 
 
+class InsufficientDiskSpace(RuntimeError):
+    pass
+
+
+def _slots_bytes(slots: dict[str, Any]) -> int:
+    total = 0
+    for v in slots.values():
+        if torch.is_tensor(v):
+            total += v.numel() * v.element_size()
+        elif isinstance(v, list):
+            total += sum(
+                t.numel() * t.element_size()
+                for _, t in v
+                if torch.is_tensor(t)
+            )
+    return total
+
+
 def offload_slots(root: Path, seg_index: int, slots: dict[str, Any]) -> Path:
+    need = _slots_bytes(slots)
+    free = shutil.disk_usage(root).free
+    if free < need * 1.3 + 1024**3:
+        raise InsufficientDiskSpace(
+            f"offload seg #{seg_index + 1} needs ~{need / 1024**3:.1f}GB, "
+            f"only {free / 1024**3:.1f}GB free on {root}"
+        )
     path = root / f"seg_{int(seg_index):04d}.pt"
     tmp = path.with_suffix(".tmp")
-    torch.save(slots, tmp)
-    tmp.replace(path)
+    try:
+        torch.save(slots, tmp)
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return path
 
 

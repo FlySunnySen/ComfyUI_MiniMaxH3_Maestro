@@ -456,7 +456,25 @@ def _offload_finished_segment_pixels(
         v is not None and not (isinstance(v, list) and not v) for v in slots.values()
     ):
         return 0.0
-    path = offload_slots(offload_dir, idx, slots)
+    try:
+        offload_slots(offload_dir, idx, slots)
+    except Exception as exc:
+        # Offloading is an optimization, not an obligation: restore the dicts
+        # so the run continues with in-RAM pixels (the old behavior).
+        log.warning(
+            "MiniMax H3 Director: offload seg #%d failed (%s); keeping pixels in RAM",
+            idx + 1,
+            exc,
+        )
+        if slots["outputs"] is not None:
+            completed_outputs[idx] = slots["outputs"]
+        if slots["pre_refine"] is not None:
+            completed_pre_refine[idx] = slots["pre_refine"]
+        if slots["pre_face"] is not None:
+            completed_pre_face[idx] = slots["pre_face"]
+        if slots["refine_passes"] is not None:
+            completed_refine_passes[idx] = slots["refine_passes"]
+        return 0.0
     stored = sum(
         v.numel() * v.element_size()
         for v in slots.values()
@@ -484,7 +502,7 @@ def _offload_finished_segment_pixels(
     gc.collect()
     log.info(
         "MiniMax H3 Director: offloaded seg #%d export pixels (%.1fGB) → %s",
-        idx + 1, stored / (1024**3), path,
+        idx + 1, stored / (1024**3), offload_dir,
     )
     return float(stored)
 
@@ -608,6 +626,7 @@ def execute_director_plan_core(
         reports.append(f"Segment mp4 export dir: {mp4_run_dir}")
     offload_dir = new_offload_dir(plan)
     offloaded: set[int] = set()
+    offload_disabled = False
     if offload_dir is not None:
         reports.append(
             "Export: 全部导出像素落盘开启 — 每段完成后前段像素转存磁盘，"
@@ -712,7 +731,7 @@ def execute_director_plan_core(
     def _run_one_segment(
         seg, *, progress_index: int
     ) -> tuple[torch.Tensor, dict[str, Any] | None, torch.Tensor, torch.Tensor]:
-        nonlocal held_for_confirmation
+        nonlocal held_for_confirmation, offload_disabled
         if seg.task_key not in SUPPORTED_TASK_KEYS:
             raise ValueError(
                 f"Task '{seg.task_key}' is not supported on MiniMax H3 Director. "
@@ -1615,7 +1634,12 @@ def execute_director_plan_core(
                     if prev_pre is None or int(prev_pre.shape[0]) < 1:
                         prev_pre = prev_export
                     pre_chunk = match_export_opening_grade(pre_chunk, prev_pre)
-        if offload_dir is not None and prev_idx >= 0 and prev_idx in completed_outputs:
+        if (
+            offload_dir is not None
+            and not offload_disabled
+            and prev_idx >= 0
+            and prev_idx in completed_outputs
+        ):
             # Pin/trim (segment start) and the opening grade above are the last
             # consumers of the predecessor's full pixels. Persist them before
             # FaceRefine builds its own copies on top.
@@ -1640,6 +1664,16 @@ def execute_director_plan_core(
                 reports.append(
                     f"Segment {ui_idx + 1}/{timeline_seg_total}: "
                     f"前段 #{prev_idx + 1} 导出像素已落盘（{stored / (1024**3):.1f}GB），拼接前读回。"
+                )
+            else:
+                # Disk too small (or unwritable): stop trying for the rest of
+                # this run; _offload_finished_segment_pixels restored the RAM
+                # state already. offload_dir stays valid so already-offloaded
+                # segments still reload before the merge.
+                offload_disabled = True
+                reports.append(
+                    f"Segment {ui_idx + 1}/{timeline_seg_total}: "
+                    "前段像素落盘失败（磁盘空间不足？），本次运行改为内存驻留。"
                 )
         if hold_after_first and pre_chunk is chunk:
             pre_chunk = chunk.clone()

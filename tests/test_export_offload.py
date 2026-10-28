@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -165,6 +166,80 @@ class OffloadFinishedSegmentPixelsTest(unittest.TestCase):
         )
         self.assertEqual(stored, 0.0)
         self.assertIn(1, completed_outputs)
+
+
+class OffloadFailureTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_offload_slots_raises_on_small_disk(self):
+        from ComfyUI_MiniMaxH3_Director.director.export_offload import (
+            InsufficientDiskSpace,
+        )
+
+        big = make_chunk(100)
+        with mock.patch(
+            "ComfyUI_MiniMaxH3_Director.director.export_offload.shutil.disk_usage",
+            return_value=mock.Mock(free=512 * 1024**2),
+        ):
+            with self.assertRaises(InsufficientDiskSpace):
+                offload_slots(self.root, 0, {"outputs": big})
+        self.assertFalse((self.root / "seg_0000.tmp").exists())
+        self.assertFalse((self.root / "seg_0000.pt").exists())
+
+    def test_offload_slots_cleans_tmp_on_save_failure(self):
+        big = make_chunk(100)
+        with mock.patch.object(
+            export_offload.torch, "save", side_effect=RuntimeError("disk full")
+        ), mock.patch(
+            "ComfyUI_MiniMaxH3_Director.director.export_offload.shutil.disk_usage",
+            return_value=mock.Mock(free=1024**4),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                offload_slots(self.root, 0, {"outputs": big})
+        self.assertFalse((self.root / "seg_0000.tmp").exists())
+
+    def test_finished_pixels_restored_when_offload_fails(self):
+        from ComfyUI_MiniMaxH3_Director.director.executor_core import (
+            _offload_finished_segment_pixels,
+        )
+
+        chunk = make_chunk(6, fill=0.5)
+        pre = make_chunk(6, h=4, w=4, fill=0.25)
+        completed_outputs = {1: chunk}
+        completed_pre_refine = {1: pre}
+        completed_pre_face = {1: chunk}
+        completed_refine_passes = {1: []}
+        segment_outputs = [make_chunk(1), chunk]
+        segment_pre_refine = [make_chunk(1), pre]
+        with mock.patch(
+            "ComfyUI_MiniMaxH3_Director.director.executor_core.offload_slots",
+            side_effect=RuntimeError("no space"),
+        ):
+            stored = _offload_finished_segment_pixels(
+                1,
+                self.root,
+                completed_outputs=completed_outputs,
+                completed_pre_refine=completed_pre_refine,
+                completed_pre_face=completed_pre_face,
+                completed_refine_passes=completed_refine_passes,
+                segment_outputs=segment_outputs,
+                segment_pre_refine=segment_pre_refine,
+                segment_pre_face=None,
+                progress_pos={1: 1},
+            )
+        self.assertEqual(stored, 0.0)
+        # Dicts restored — the merge still finds full pixels in RAM.
+        self.assertIs(completed_outputs[1], chunk)
+        self.assertIs(completed_pre_refine[1], pre)
+        self.assertIs(completed_pre_face[1], chunk)
+        # Run slots NOT posterized (they still hold the real tensors).
+        self.assertIs(segment_outputs[1], chunk)
+        self.assertIs(segment_pre_refine[1], pre)
 
 
 if __name__ == "__main__":
