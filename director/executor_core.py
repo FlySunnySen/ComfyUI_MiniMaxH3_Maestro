@@ -26,6 +26,12 @@ from .refine_pack import (
     refine_will_sample,
 )
 from .refine_sampling import apply_segment_refine
+from .export_offload import (
+    load_offloaded_slots,
+    new_offload_dir,
+    offload_slots,
+    remove_offload_dir,
+)
 from .segment_loras import apply_segment_loras, describe_lora_rows
 from .frame_align import minimax_align_frame_count
 from .audio_export import (
@@ -411,6 +417,78 @@ def _release_segment_pixels(
     return had
 
 
+def _offload_finished_segment_pixels(
+    index: int,
+    offload_dir,
+    *,
+    completed_outputs: dict[int, torch.Tensor],
+    completed_pre_refine: dict[int, torch.Tensor],
+    completed_pre_face: dict[int, torch.Tensor],
+    completed_refine_passes: dict[int, list[tuple[str, torch.Tensor]]],
+    segment_outputs: list[torch.Tensor],
+    segment_pre_refine: list[torch.Tensor],
+    segment_pre_face: list[torch.Tensor] | None,
+    progress_pos: dict[int, int],
+    output_chunks: list[torch.Tensor] | None = None,
+    output_pre_chunks: list[torch.Tensor] | None = None,
+    output_pre_face_chunks: list[torch.Tensor] | None = None,
+    output_segments: list | None = None,
+) -> float:
+    """Persist a finished segment's export pixels to disk and drop them from RAM.
+
+    「全部导出」 keeps every chunk until the final merge, so predecessor pixels
+    would otherwise ride through the next segment's FaceRefine peak. The merge
+    reloads these slots via completed_outputs before concat. Returns the
+    offloaded size in bytes (0 when nothing was stored).
+    """
+    if offload_dir is None:
+        return 0.0
+    idx = int(index)
+    if idx < 0:
+        return 0.0
+    slots = {
+        "outputs": completed_outputs.pop(idx, None),
+        "pre_refine": completed_pre_refine.pop(idx, None),
+        "pre_face": completed_pre_face.pop(idx, None),
+        "refine_passes": completed_refine_passes.pop(idx, None),
+    }
+    if not any(
+        v is not None and not (isinstance(v, list) and not v) for v in slots.values()
+    ):
+        return 0.0
+    path = offload_slots(offload_dir, idx, slots)
+    stored = sum(
+        v.numel() * v.element_size()
+        for v in slots.values()
+        if torch.is_tensor(v)
+    )
+    poster = _poster_frame(slots["outputs"]) if torch.is_tensor(slots["outputs"]) else None
+
+    def _poster_slot(seq: list[torch.Tensor], pos: int) -> None:
+        if poster is not None and 0 <= pos < len(seq):
+            seq[pos] = poster
+
+    run_pos = progress_pos.get(idx)
+    if run_pos is not None:
+        _poster_slot(segment_outputs, run_pos)
+        _poster_slot(segment_pre_refine, run_pos)
+        if segment_pre_face is not None:
+            _poster_slot(segment_pre_face, run_pos)
+    if output_segments is not None:
+        for pos, seg in enumerate(output_segments):
+            if int(getattr(seg, "index", -1)) == idx:
+                _poster_slot(output_chunks, pos)
+                _poster_slot(output_pre_chunks, pos)
+                _poster_slot(output_pre_face_chunks, pos)
+                break
+    gc.collect()
+    log.info(
+        "MiniMax H3 Director: offloaded seg #%d export pixels (%.1fGB) → %s",
+        idx + 1, stored / (1024**3), path,
+    )
+    return float(stored)
+
+
 def _ref_video_audios_to_dict(items) -> dict | None:
     out: dict = {}
     for item in items or []:
@@ -528,6 +606,13 @@ def execute_director_plan_core(
     plan.segment_mp4_run_dir = str(mp4_run_dir) if mp4_run_dir is not None else None
     if mp4_run_dir is not None:
         reports.append(f"Segment mp4 export dir: {mp4_run_dir}")
+    offload_dir = new_offload_dir(plan)
+    offloaded: set[int] = set()
+    if offload_dir is not None:
+        reports.append(
+            "Export: 全部导出像素落盘开启 — 每段完成后前段像素转存磁盘，"
+            "拼接前读回（降低脸修/采样阶段的内存峰值）。"
+        )
     if live_tae_preview:
         reports.append("Live preview: ON — 采样中 TAE 动态预览（成片看下游 CreateVideo / SaveVideo）。")
     else:
@@ -1530,6 +1615,32 @@ def execute_director_plan_core(
                     if prev_pre is None or int(prev_pre.shape[0]) < 1:
                         prev_pre = prev_export
                     pre_chunk = match_export_opening_grade(pre_chunk, prev_pre)
+        if offload_dir is not None and prev_idx >= 0 and prev_idx in completed_outputs:
+            # Pin/trim (segment start) and the opening grade above are the last
+            # consumers of the predecessor's full pixels. Persist them before
+            # FaceRefine builds its own copies on top.
+            stored = _offload_finished_segment_pixels(
+                prev_idx,
+                offload_dir,
+                completed_outputs=completed_outputs,
+                completed_pre_refine=completed_pre_refine,
+                completed_pre_face=completed_pre_face,
+                completed_refine_passes=completed_refine_passes,
+                segment_outputs=segment_outputs,
+                segment_pre_refine=segment_pre_refine,
+                segment_pre_face=segment_pre_face,
+                progress_pos=progress_pos,
+                output_chunks=output_chunks,
+                output_pre_chunks=output_pre_chunks,
+                output_pre_face_chunks=output_pre_face_chunks,
+                output_segments=output_segments,
+            )
+            if stored > 0:
+                offloaded.add(prev_idx)
+                reports.append(
+                    f"Segment {ui_idx + 1}/{timeline_seg_total}: "
+                    f"前段 #{prev_idx + 1} 导出像素已落盘（{stored / (1024**3):.1f}GB），拼接前读回。"
+                )
         if hold_after_first and pre_chunk is chunk:
             pre_chunk = chunk.clone()
         decode_s = time.perf_counter() - t_decode
@@ -1879,6 +1990,30 @@ def execute_director_plan_core(
     )
     # Prefer completed_outputs: motion-context may have trimmed a prev export
     # tail (phase-align pin gap) after that chunk was already appended here.
+    if offloaded:
+        # Sampling is finished — the merge needs RAM far more than the staged
+        # weights. Unload before streaming pixels back from disk.
+        cleanup_segment_vram(enabled=True, unload_models=True)
+        reports.append(
+            f"Export: 拼接前卸载模型，从磁盘读回已落盘的 {len(offloaded)} 个分段像素。"
+        )
+    for i, seg in enumerate(export_segments):
+        if int(seg.index) in offloaded and offload_dir is not None:
+            slots = load_offloaded_slots(offload_dir, seg.index)
+            if torch.is_tensor(slots.get("outputs")):
+                completed_outputs[seg.index] = slots["outputs"]
+            if torch.is_tensor(slots.get("pre_refine")):
+                completed_pre_refine[seg.index] = slots["pre_refine"]
+            if torch.is_tensor(slots.get("pre_face")):
+                completed_pre_face[seg.index] = slots["pre_face"]
+            if slots.get("refine_passes"):
+                completed_refine_passes[seg.index] = slots["refine_passes"]
+            log.info(
+                "MiniMax H3 Director: reloaded seg #%d export pixels for merge",
+                seg.index + 1,
+            )
+    if offloaded and offload_dir is not None:
+        remove_offload_dir(offload_dir)
     for i, seg in enumerate(export_segments):
         patched = completed_outputs.get(seg.index)
         if patched is not None:
