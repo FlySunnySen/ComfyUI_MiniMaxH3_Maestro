@@ -33,6 +33,7 @@ from .export_offload import (
     remove_offload_dir,
 )
 from .segment_loras import apply_segment_loras, describe_lora_rows
+from .segment_mp4_export import merge_segment_mp4s
 from .frame_align import minimax_align_frame_count
 from .audio_export import (
     AUDIO_MODE_GENERATE,
@@ -2010,6 +2011,13 @@ def execute_director_plan_core(
 
     if not output_chunks and not segment_outputs:
         raise ValueError("Director plan produced no segments.")
+
+    if mp4_run_dir is not None:
+        merged_path = merge_segment_mp4s(mp4_run_dir, plan)
+        if merged_path:
+            reports.append(
+                f"Segment mp4 merged (分段已保留) → {merged_path}"
+            )
 
     report_director_finish(progress_node_id, seg_total)
     export_chunks = output_chunks if output_chunks else segment_outputs

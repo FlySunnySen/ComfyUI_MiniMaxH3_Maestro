@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -221,6 +222,72 @@ def copy_segment_mp4_suffix(
             dest.name,
             exc,
         )
+        return None
+
+
+def merge_segment_mp4s(run_dir: Path | None, plan: DirectorPlan) -> str | None:
+    """Concatenate the per-segment mp4s into ``merged.mp4`` next to them.
+
+    Stream copy via the ffmpeg concat demuxer — every segment comes from the
+    same ``write_frames_to_mp4`` pipeline (libx264/yuv420p, same fps, matching
+    audio codec), so no re-encode is needed. Never raises; returns the merged
+    path or None.
+    """
+    if run_dir is None or getattr(plan, "export_mode", "all") != "segments":
+        return None
+    parts = sorted(Path(run_dir).glob("seg_[0-9][0-9][0-9][0-9].mp4"))
+    if len(parts) < 2:
+        return None
+    try:
+        from ..lib.video_export import _ffmpeg_bin
+
+        ffmpeg = _ffmpeg_bin()
+        if not ffmpeg:
+            log.warning("Segment mp4 merge skipped: ffmpeg unavailable.")
+            return None
+        merged = Path(run_dir) / "merged.mp4"
+        listing = Path(run_dir) / "concat_list.txt"
+        listing.write_text(
+            "".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8"
+        )
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(listing),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(merged),
+            ],
+            capture_output=True,
+            timeout=600,
+        )
+        if proc.returncode != 0 or not merged.is_file() or merged.stat().st_size <= 0:
+            err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+            log.warning(
+                "Segment mp4 merge failed (segments kept): %s",
+                err or f"exit={proc.returncode}",
+            )
+            merged.unlink(missing_ok=True)
+            return None
+        log.info(
+            "MiniMax H3 Director merged %d segment mp4s → %s",
+            len(parts),
+            merged,
+        )
+        return str(merged)
+    except Exception as exc:
+        log.warning("Segment mp4 merge failed (segments kept): %s", exc)
         return None
 
 
