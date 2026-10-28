@@ -1636,46 +1636,62 @@ def execute_director_plan_core(
                     if prev_pre is None or int(prev_pre.shape[0]) < 1:
                         prev_pre = prev_export
                     pre_chunk = match_export_opening_grade(pre_chunk, prev_pre)
-        if (
-            offload_dir is not None
-            and not offload_disabled
-            and prev_idx >= 0
-            and prev_idx in completed_outputs
-        ):
+        if prev_idx >= 0 and prev_idx in completed_outputs:
             # Pin/trim (segment start) and the opening grade above are the last
             # consumers of the predecessor's full pixels. Persist them before
             # FaceRefine builds its own copies on top.
-            stored = _offload_finished_segment_pixels(
-                prev_idx,
-                offload_dir,
-                completed_outputs=completed_outputs,
-                completed_pre_refine=completed_pre_refine,
-                completed_pre_face=completed_pre_face,
-                completed_refine_passes=completed_refine_passes,
-                segment_outputs=segment_outputs,
-                segment_pre_refine=segment_pre_refine,
-                segment_pre_face=segment_pre_face,
-                progress_pos=progress_pos,
-                output_chunks=output_chunks,
-                output_pre_chunks=output_pre_chunks,
-                output_pre_face_chunks=output_pre_face_chunks,
-                output_segments=output_segments,
-            )
-            if stored > 0:
-                offloaded.add(prev_idx)
-                reports.append(
-                    f"Segment {ui_idx + 1}/{timeline_seg_total}: "
-                    f"前段 #{prev_idx + 1} 导出像素已落盘（{stored / (1024**3):.1f}GB），拼接前读回。"
+            if offload_dir is not None and not offload_disabled:
+                stored = _offload_finished_segment_pixels(
+                    prev_idx,
+                    offload_dir,
+                    completed_outputs=completed_outputs,
+                    completed_pre_refine=completed_pre_refine,
+                    completed_pre_face=completed_pre_face,
+                    completed_refine_passes=completed_refine_passes,
+                    segment_outputs=segment_outputs,
+                    segment_pre_refine=segment_pre_refine,
+                    segment_pre_face=segment_pre_face,
+                    progress_pos=progress_pos,
+                    output_chunks=output_chunks,
+                    output_pre_chunks=output_pre_chunks,
+                    output_pre_face_chunks=output_pre_face_chunks,
+                    output_segments=output_segments,
                 )
-            else:
-                # Disk too small (or unwritable): stop trying for the rest of
-                # this run; _offload_finished_segment_pixels restored the RAM
-                # state already. offload_dir stays valid so already-offloaded
-                # segments still reload before the merge.
-                offload_disabled = True
+                if stored > 0:
+                    offloaded.add(prev_idx)
+                    reports.append(
+                        f"Segment {ui_idx + 1}/{timeline_seg_total}: "
+                        f"前段 #{prev_idx + 1} 导出像素已落盘（{stored / (1024**3):.1f}GB），拼接前读回。"
+                    )
+                else:
+                    # Disk too small (or unwritable): stop trying for the rest of
+                    # this run; _offload_finished_segment_pixels restored the RAM
+                    # state already. offload_dir stays valid so already-offloaded
+                    # segments still reload before the merge.
+                    offload_disabled = True
+                    reports.append(
+                        f"Segment {ui_idx + 1}/{timeline_seg_total}: "
+                        "前段像素落盘失败（磁盘空间不足？），本次运行改为内存驻留。"
+                    )
+            elif export_segments_mode:
+                # Segments mode has no merge waiting on these pixels (mp4s are
+                # already on disk) — drop them now instead of riding through
+                # this segment's FaceRefine peak. The done-time release below
+                # is idempotent for paths that skip the grade (hold).
+                _release_segment_pixels(
+                    prev_idx,
+                    completed_outputs=completed_outputs,
+                    completed_pre_refine=completed_pre_refine,
+                    completed_refine_passes=completed_refine_passes,
+                    segment_outputs=segment_outputs,
+                    segment_pre_refine=segment_pre_refine,
+                    progress_pos=progress_pos,
+                    completed_pre_face=completed_pre_face,
+                    segment_pre_face=segment_pre_face,
+                )
                 reports.append(
                     f"Segment {ui_idx + 1}/{timeline_seg_total}: "
-                    "前段像素落盘失败（磁盘空间不足？），本次运行改为内存驻留。"
+                    f"前段 #{prev_idx + 1} 像素已释放（mp4 已落盘）。"
                 )
         if hold_after_first and pre_chunk is chunk:
             pre_chunk = chunk.clone()
