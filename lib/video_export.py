@@ -191,3 +191,43 @@ def write_frames_to_mp4(
         return dest
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def read_mp4_frames(path: str | Path, *, width: int, height: int) -> torch.Tensor:
+    """Decode an mp4 to float RGB frames ``[T, H, W, 3]`` in ``[0, 1]``.
+
+    Frames are scaled to ``width``×``height`` so the caller does not need to
+    probe the file first. Raises on failure.
+    """
+    ffmpeg = _ffmpeg_bin()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg unavailable (install FFmpeg on PATH or `pip install imageio-ffmpeg`)")
+    w, h = int(width), int(height)
+    if w <= 0 or h <= 0:
+        raise ValueError("read_mp4_frames needs positive width/height")
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-vf",
+        f"scale={w}:{h}",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    raw, stderr = proc.communicate()
+    if proc.returncode != 0 or not raw:
+        err = (stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg decode failed (code={proc.returncode}): {err or 'empty output'}")
+    frame_bytes = h * w * 3
+    n = len(raw) // frame_bytes
+    if n <= 0:
+        raise RuntimeError("ffmpeg decoded 0 frames")
+    rgb = np.frombuffer(raw[: n * frame_bytes], dtype=np.uint8).reshape(n, h, w, 3)
+    return torch.from_numpy(rgb.copy()).float().div_(255.0)

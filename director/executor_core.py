@@ -34,6 +34,7 @@ from .export_offload import (
 )
 from .segment_loras import apply_segment_loras, describe_lora_rows
 from .segment_mp4_export import merge_segment_mp4s
+from ..lib.video_export import read_mp4_frames
 from .frame_align import minimax_align_frame_count
 from .audio_export import (
     AUDIO_MODE_GENERATE,
@@ -2012,9 +2013,11 @@ def execute_director_plan_core(
     if not output_chunks and not segment_outputs:
         raise ValueError("Director plan produced no segments.")
 
+    merged_mp4_path: str | None = None
     if mp4_run_dir is not None:
         merged_path = merge_segment_mp4s(mp4_run_dir, plan)
         if merged_path:
+            merged_mp4_path = merged_path
             reports.append(
                 f"Segment mp4 merged (分段已保留) → {merged_path}"
             )
@@ -2103,6 +2106,31 @@ def execute_director_plan_core(
         # (older slots are 1-frame posters after release).
         fallback = torch.full((1, 1, 1, 3), 0.5)
         combined = segment_outputs[-1] if segment_outputs else fallback
+        if (
+            merged_mp4_path
+            and combined.ndim == 4
+            and int(combined.shape[0]) > 1
+        ):
+            # The workflow IMAGE slot should show the whole timeline, not just
+            # the last segment. All compute is done — unload the staged weights
+            # before decoding the merged file back to frames.
+            try:
+                cleanup_segment_vram(enabled=True, unload_models=True)
+                decoded = read_mp4_frames(
+                    merged_mp4_path,
+                    width=int(combined.shape[2]),
+                    height=int(combined.shape[1]),
+                )
+                combined = decoded
+                reports.append(
+                    f"Combined IMAGE: 已从 merged.mp4 解码全片（{int(combined.shape[0])} 帧）。"
+                )
+            except Exception as exc:
+                log.warning(
+                    "MiniMax H3 Director: merged.mp4 decode failed; "
+                    "IMAGE slot shows the last segment (%s)",
+                    exc,
+                )
         pre_combined = (
             segment_pre_refine[-1]
             if segment_pre_refine
